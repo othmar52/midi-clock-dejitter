@@ -7,6 +7,13 @@
 
 #define USE_LCD
 
+#define USE_MIDI_LIBRARY
+
+#ifdef USE_MIDI_LIBRARY
+#include <MIDI.h>
+#endif
+
+
 #ifdef USE_LCD
 #include <LiquidCrystal.h>
 const int rs = 12, en = 11, d4 = 7, d5 = 6, d6 = 5, d7 = 4;
@@ -19,66 +26,61 @@ LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
 SoftwareSerial MIDI(2, 3); // RX, TX
 #endif
 
-uint32_t currentMicros = 0;                // should be uint32_t
+uint32_t currentMicros = 0;
+const int8_t ppqn = 24;
+bool weHaveADebouncedTempo = false;
 
-const int ppqn = 24;                       // should be uint8_t
-int64_t inClockQuarterBarTickCounter = 0;  // should be uint8_t     as it loops from 0 to 24 (ppqn)
-uint32_t inClockLastQuarterBarStart = 0;   // should be uint32_t
-uint32_t inClockTickCounter = 0;           // should be uint32_t
+// incoming (jittered) clock
+int8_t inClockQuarterBarTickCounter = 0; // loops from 0 to 24 (ppqn)
+uint32_t inClockLastQuarterBarStart = 0;
+uint32_t inClockTickCounter = 0;
+int8_t inClockFullBarTickCounter = 0;    // loops from 0 to 96 (4*ppqn)
 
-int64_t inClockFullBarTickCounter = 0;     // should be uint8_t as it loops from 0 to 96 (4*ppqn)
-uint32_t inClockLastFullBarStart = 0;      // should be uint32_t
+// outgoing (dejittered) clock
+int8_t outClockFullBarTickCounter = 0;   // loops from 0 to 96 (4*ppqn)
+uint32_t outClockLastFullBarStart = 0;
+uint32_t outClockTickCounter = 0;
 
-int64_t outClockFullBarTickCounter = 0;    // should be uint8_t as it loops from 0 to 96 (4*ppqn)
-uint32_t outClockLastFullBarStart = 0;     // should be uint32_t
-uint32_t outClockTickCounter = 0;          // should be uint32_t
+uint32_t scheduledNextTickMicroSecond = 0;
 
-uint32_t tempLastStartMicros = 0;          // should be uint32_t
+// incoming serial data
+int incomingByte = 0;
 
-uint32_t tempScheduledNextTick = 0;        // should be uint32_t
-
-bool waitForTicks = true;
-
-RunningMedian recentQuarterBarDurations = RunningMedian(10);
-// add another debounce level
-RunningMedian recentQuarterBarDurations2 = RunningMedian(10);
-
-
+// helper variables for debouncing incoming tempo
 int32_t debouncedTickWidth = 0;          // should be uint32_t
-int32_t debouncedTickWidthWithDelta = 0; // should be uint32_t
+RunningMedian recentQuarterBarDurations = RunningMedian(10);
+RunningMedian recentDebouncedTickWidths = RunningMedian(10);
 
 
 // positive = send later than recieve
 // negative = send before recieve
 const int16_t clockDelayMilliseconds = -30;
 
-// int16_t softTickWidthDelta = 0;
 const int8_t softTickNumTreshold = 5;
 const int16_t softCorrectionMicros = 300;
 
 bool weAreToSlow = false;
 bool weAreToFast = false;
 #ifndef USE_SOFTWARE_SERIAL_PIN_2_3
+// rename "Serial" to "MIDI "to can use different configurations without renaming variables
 HardwareSerial & MIDI = Serial;
 #endif
+
+
 void setup() {
 #ifdef USE_SOFTWARE_SERIAL_PIN_2_3
   Serial.begin(115200);
   Serial.println("starting serial with debug monitor....");
+#endif
   MIDI.begin(31250);
-#endif
-#ifndef USE_SOFTWARE_SERIAL_PIN_2_3
-  MIDI.begin(31250); // MIDI baud rate
-#endif
-
+ 
 #ifdef USE_LCD
   lcd.begin(16, 2);
   lcd.print("hi");
 #endif
 
-  tempLastStartMicros = micros();
 }
-int incomingByte = 0;
+
 void loop() {
   currentMicros = micros();
   if (MIDI.available()) {
@@ -87,22 +89,10 @@ void loop() {
       handleMidiEventClock();
     }
     if (incomingByte == 0xFA) {
-      resetJitterHelperVariables();
       handleMidiEventStart();
-#ifdef USE_LCD
-      lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print("start");
-#endif
     }
     if (incomingByte == 0xFC) {
       handleMidiEventStop();
-      resetJitterHelperVariables();
-#ifdef USE_LCD
-      lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print("stop");
-#endif
     }
   }
   
@@ -116,24 +106,18 @@ void resetJitterHelperVariables() {
   inClockLastQuarterBarStart = 0;
   inClockTickCounter = 0;
   inClockFullBarTickCounter = 0;
-  inClockLastFullBarStart = 0;
   
   outClockFullBarTickCounter = 0;
   outClockLastFullBarStart = 0;
   outClockTickCounter = 0;
   
-  waitForTicks = true;
+  weHaveADebouncedTempo = false;
   
   recentQuarterBarDurations.clear();
-  recentQuarterBarDurations2.clear();
+  recentDebouncedTickWidths.clear();
 
   debouncedTickWidth = 0;
-  debouncedTickWidthWithDelta = 0;
-  
-  //softTickWidthDelta = 0;
 
-  weAreToSlow = false;
-  weAreToFast = false;
 }
 
 void handleMidiEventTick() {
@@ -141,6 +125,9 @@ void handleMidiEventTick() {
 }
 
 
+/**
+ * we got a clock tick from incoming clock
+ */
 void handleMidiEventClock() {
   //MIDI.sendClock();
   //softSerial.write(0xF8);
@@ -150,24 +137,16 @@ void handleMidiEventClock() {
   inClockFullBarTickCounter+=1;
   if (inClockFullBarTickCounter == ppqn * 4) {
     inClockFullBarTickCounter = 0;
-    inClockLastFullBarStart = currentMicros;
-    waitForTicks = false;
+    weHaveADebouncedTempo = true;
   }
   if (inClockQuarterBarTickCounter == ppqn) {
     //debug("----------------- quarter note clock IN ----------------");
     recentQuarterBarDurations.add(currentMicros - inClockLastQuarterBarStart);
-    recentQuarterBarDurations2.add(recentQuarterBarDurations.getAverage()/ppqn);
-    debouncedTickWidth = recentQuarterBarDurations2.getAverage();
-    /*
-    if(weAreToFast == true) {
-      debug("we are to fast");
-    }
-    if(weAreToSlow == true) {
-      debug("we are to slow");
-    }
-    */
+    recentDebouncedTickWidths.add(recentQuarterBarDurations.getAverage()/ppqn);
+    debouncedTickWidth = recentDebouncedTickWidths.getAverage();
     inClockQuarterBarTickCounter = 0;
     inClockLastQuarterBarStart = currentMicros;
+
 #ifdef USE_LCD
     if (inClockFullBarTickCounter % (2*ppqn) == 0) {
       lcd.clear();
@@ -178,32 +157,40 @@ void handleMidiEventClock() {
       lcd.print(String(outClockTickCounter) + " o "+ String(diff));
     }
 #endif
+
   }
 
-  if (waitForTicks == true) {
+  if (weHaveADebouncedTempo == false) {
     sendClockTick();
   }
 }
 
+
+/**
+ * check if there is need to send out a single clock tick
+ */
 void checkSendOutClockTick() {
 
-
-  if (waitForTicks == true) {
+  if (weHaveADebouncedTempo == false) {
+    // after start we have to collect some timings for beeing able to dejitter
+    // during this phase the jittered ticks will be directly sent out in handleMidiEventClock()
     return;
   }
   
-  if (currentMicros < tempScheduledNextTick) {
-    // debug("db = 0");
+  if (currentMicros < scheduledNextTickMicroSecond) {
+    // we still have to wait before sending the tick
     return;
   }
   sendClockTick();
  
 }
 
-int tickDiff = 0;
-
 int32_t correctionDelta = 0;
 
+
+/**
+ * really send the tick and calculate the time when the next tick has to be sent
+ */
 void sendClockTick() {
   outClockTickCounter+=1;
   outClockFullBarTickCounter+=1;
@@ -214,45 +201,53 @@ void sendClockTick() {
   //MIDI.sendClock();
   MIDI.write(0xF8);
   correctionDelta = 0;
-  if(outClockTickCounter > (inClockTickCounter + 2)) {
+  if (outClockTickCounter > (inClockTickCounter + 2)) {
     // we are to fast. lets add a little time for scheduled next tick
-    
     correctionDelta = (outClockTickCounter - inClockTickCounter) * 10000;
     
   }
-  if(inClockTickCounter > (outClockTickCounter + 2)) {
+  if (inClockTickCounter > (outClockTickCounter + 2)) {
     // we are to slow. lets remove a little time for scheduled next tick
     
-    //correctionDelta = (outClockTickCounter - inClockTickCounter) * 10000;
-    // correctionDelta = debouncedTickWidth/((outClockTickCounter - inClockTickCounter) * -10000); 
-    correctionDelta = debouncedTickWidth * -1; 
+    // correctionDelta = debouncedTickWidth/((outClockTickCounter - inClockTickCounter) * -10000);
+    correctionDelta = debouncedTickWidth * -1;
     
   }
-  tempScheduledNextTick = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*debouncedTickWidth) + correctionDelta;
+  scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*debouncedTickWidth) + correctionDelta;
 }
 
 
 void handleMidiEventStart() {
   resetJitterHelperVariables();
-  tempLastStartMicros = currentMicros;
   //MIDI.sendStart();
   MIDI.write(0xFA);
-  
   inClockLastQuarterBarStart = currentMicros;
-  inClockLastFullBarStart = currentMicros;
+#ifdef USE_LCD
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print("start");
+#endif
 }
+
 void handleMidiEventStop() {
   //MIDI.sendStop();
   MIDI.write(0xFC);
   
   resetJitterHelperVariables();
+  // most clocks also send ticks during stop
+  inClockLastQuarterBarStart = currentMicros;
+
+#ifdef USE_LCD
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print("stop");
+#endif
 }
 
 float tickWidthToBpm(int32_t tickWidth)
 {
   // calculate interval of clock tick[microseconds] (24 ppqn)
-  if (tickWidth < 1)
-  {
+  if (tickWidth < 1) {
     return 0;
   }
   return 60 / (tickWidth * 0.000001 * ppqn);
@@ -261,8 +256,7 @@ float tickWidthToBpm(int32_t tickWidth)
 uint32_t bpmToTickWidth(float bpm)
 {
   // calculate interval of clock tick[microseconds] (24 ppqn)
-  if (bpm < 1)
-  {
+  if (bpm < 1) {
     return 0;
   }
   return 60 / (bpm * 0.000001 * ppqn);
