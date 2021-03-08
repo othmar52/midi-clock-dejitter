@@ -3,7 +3,7 @@
 
 // instead of using RX, TX pins of hardware serial use different pins
 // so we are able to use the debug monitor
-//#define USE_SOFTWARE_SERIAL_PIN_2_3
+// #define USE_SOFTWARE_SERIAL_PIN_2_3
 
 #define USE_LCD
 
@@ -37,17 +37,30 @@ uint32_t inClockTickCounter = 0;
 int8_t inClockFullBarTickCounter = 0;    // loops from 0 to 96 (4*ppqn)
 
 // outgoing (dejittered) clock
-int8_t outClockFullBarTickCounter = 0;   // loops from 0 to 96 (4*ppqn)
+int32_t outClockFullBarTickCounter = 0;   // loops from 0 to 96 (4*ppqn)
 uint32_t outClockLastFullBarStart = 0;
 uint32_t outClockTickCounter = 0;
 
+uint32_t outClockLastSentTick = 0;
+
 uint32_t scheduledNextTickMicroSecond = 0;
+
+const uint8_t tickDriftTreshold = 2;
+int32_t inOutDickDrift = 0;
+int32_t driftingTickWidth = 0;
+
+float currentTempo = 0.0;
 
 // incoming serial data
 int incomingByte = 0;
 
+
+const uint16_t minBpmTickWidth = 65000; // [microseconds] =~ 38 BPM
+const uint16_t maxBpmTickWidth = 8000;  // [microseconds] =~ 312 BPM
+
+
 // helper variables for debouncing incoming tempo
-int32_t debouncedTickWidth = 0;          // should be uint32_t
+int32_t debouncedTickWidth = 0;
 RunningMedian recentQuarterBarDurations = RunningMedian(10);
 RunningMedian recentDebouncedTickWidths = RunningMedian(10);
 
@@ -110,6 +123,7 @@ void resetJitterHelperVariables() {
   outClockFullBarTickCounter = 0;
   outClockLastFullBarStart = 0;
   outClockTickCounter = 0;
+  outClockLastSentTick = 0;
   
   weHaveADebouncedTempo = false;
   
@@ -117,6 +131,8 @@ void resetJitterHelperVariables() {
   recentDebouncedTickWidths.clear();
 
   debouncedTickWidth = 0;
+
+  currentTempo = 0.0;
 
 }
 
@@ -142,8 +158,13 @@ void handleMidiEventClock() {
   if (inClockQuarterBarTickCounter == ppqn) {
     //debug("----------------- quarter note clock IN ----------------");
     recentQuarterBarDurations.add(currentMicros - inClockLastQuarterBarStart);
+    if(recentDebouncedTickWidths.getHighest() - recentDebouncedTickWidths.getLowest() > 2000) {
+      // obviously we had a drastic tempo change
+      recentDebouncedTickWidths.clear();
+    }
     recentDebouncedTickWidths.add(recentQuarterBarDurations.getAverage()/ppqn);
     debouncedTickWidth = recentDebouncedTickWidths.getAverage();
+    currentTempo = tickWidthToBpm(debouncedTickWidth);
     inClockQuarterBarTickCounter = 0;
     inClockLastQuarterBarStart = currentMicros;
 
@@ -151,7 +172,7 @@ void handleMidiEventClock() {
     if (inClockFullBarTickCounter % (2*ppqn) == 0) {
       lcd.clear();
       lcd.setCursor(0,0);
-      lcd.print(String(inClockTickCounter) + " i " + String(tickWidthToBpm(debouncedTickWidth)) + "bpm");
+      lcd.print(String(inClockTickCounter) + " i " + String(currentTempo) + "bpm");
       lcd.setCursor(0,1);
       int32_t diff = outClockTickCounter - inClockTickCounter;
       lcd.print(String(outClockTickCounter) + " o "+ String(diff));
@@ -176,46 +197,106 @@ void checkSendOutClockTick() {
     // during this phase the jittered ticks will be directly sent out in handleMidiEventClock()
     return;
   }
-  
-  if (currentMicros < scheduledNextTickMicroSecond) {
+
+  if (currentMicros <= scheduledNextTickMicroSecond) {
     // we still have to wait before sending the tick
     return;
   }
+  
+  if( currentMicros - outClockLastSentTick < maxBpmTickWidth) {
+    // never send a tempo faster than 312 BPM
+    //MIDI.write(0xFF);  // sestem reset - for debugging over serial...
+    return;
+  }
+  
+  //if( currentMicros - outClockLastSentTick > minBpmTickWidth) {
+  //  // never send a tempo slower than 38 BPM
+  //  return;
+  //}
+  
   sendClockTick();
  
 }
 
 int32_t correctionDelta = 0;
 
-
 /**
  * really send the tick and calculate the time when the next tick has to be sent
  */
 void sendClockTick() {
+  if (outClockTickCounter == 0) {
+    outClockLastFullBarStart = currentMicros;
+  }
   outClockTickCounter+=1;
   outClockFullBarTickCounter+=1;
+  outClockLastSentTick = currentMicros;
   if (outClockFullBarTickCounter == ppqn*4) {
     outClockLastFullBarStart = currentMicros;
     outClockFullBarTickCounter = 0;
   }
   //MIDI.sendClock();
   MIDI.write(0xF8);
-  correctionDelta = 0;
-  if (outClockTickCounter > (inClockTickCounter + 2)) {
-    // we are to fast. lets add a little time for scheduled next tick
-    correctionDelta = (outClockTickCounter - inClockTickCounter) * 10000;
-    
+  //scheduleNextTick();
+  // without any drift next tick has to be sent in debouncedTickWidth microseconds
+  scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*debouncedTickWidth);
+
+  if (inClockTickCounter > (outClockTickCounter + tickDriftTreshold)) {
+    // we are behind. lets remove a little time of scheduled next tick by increasing the tempo
+    inOutDickDrift = inClockTickCounter - outClockTickCounter;
+
+    driftingTickWidth = bpmToTickWidth((float)(currentTempo + inOutDickDrift));
+
+    scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*driftingTickWidth);
+
+    //scheduledNextTickMicroSecond = 10;
+    //scheduledNextTickMicroSecond -= (inOutDickDrift * (debouncedTickWidth/inOutDickDrift));
+    MIDI.write(0xFB);  // continue  (just for debuggung over serial visible in aseqdump)
+    return;
   }
-  if (inClockTickCounter > (outClockTickCounter + 2)) {
-    // we are to slow. lets remove a little time for scheduled next tick
+
+  if (outClockTickCounter > (inClockTickCounter + tickDriftTreshold)) {
+    // our in out tick drift is tooo large (we are to fast)
+    // add a little time to te schedule
     
-    // correctionDelta = debouncedTickWidth/((outClockTickCounter - inClockTickCounter) * -10000);
-    correctionDelta = debouncedTickWidth * -1;
+    inOutDickDrift = outClockTickCounter - inClockTickCounter;
+
+    driftingTickWidth = (inOutDickDrift > currentTempo)
+      ? minBpmTickWidth
+      : bpmToTickWidth((float)(currentTempo - inOutDickDrift));
+
+    scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*driftingTickWidth);
     
+    //scheduledNextTickMicroSecond += (inOutDickDrift * (debouncedTickWidth/inOutDickDrift));
+    MIDI.write(0xFE);  // active sensing  (just for debuggung over serial visible in aseqdump)
   }
-  scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*debouncedTickWidth) + correctionDelta;
+  
 }
 
+/**
+ * this function checks if we have an I/O drift [tickAmount]
+ * and adds or removes a few microseconds to the next tick scheduli8ng in case we need correction
+ */
+ /*
+void scheduleNextTick () {
+  // without any drift next tick has to be sent in debouncedTickWidth microseconds
+  scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*debouncedTickWidth);
+
+  if (inClockTickCounter > (outClockTickCounter + tickDriftTreshold)) {
+    // we are to slow. lets remove a little time of scheduled next tick
+    scheduledNextTickMicroSecond = 10;
+    //scheduledNextTickMicroSecond = scheduledNextTickMicroSecond - debouncedTickWidth + (debouncedTickWidth/(inClockTickCounter - outClockTickCounter));
+    MIDI.write(0xFB);  // continue  (just for debuggung over serial visible in aseqdump)
+    return;
+  }
+
+  if (outClockTickCounter > (inClockTickCounter + tickDriftTreshold)) {
+    // our in out tick drift is tooo large (we are to fast)
+    // add a little time to te schedule
+    scheduledNextTickMicroSecond += ((outClockTickCounter - inClockTickCounter) * (debouncedTickWidth/(outClockTickCounter - inClockTickCounter)));
+    MIDI.write(0xFE);  // active sensing  (just for debuggung over serial visible in aseqdump)
+  }
+}
+*/
 
 void handleMidiEventStart() {
   resetJitterHelperVariables();
