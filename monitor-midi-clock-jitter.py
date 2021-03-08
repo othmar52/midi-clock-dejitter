@@ -11,7 +11,7 @@ minTickWidth=1000000
 def main():
   print ('hello')
   process = subprocess.Popen(['aseqdump', '-p', '24:0'], stdout=subprocess.PIPE, cwd=None)
-  lastSecond = 0
+  lastSecond = None
   counter = 0
   minTickWidth = 1000000
   maxTickWidth = 0
@@ -23,20 +23,19 @@ def main():
     if not line:
       break
     counter += 1
-    if counter < 3:
-      continue
-    #print(line)
-    now = datetime.now()
-    currentSecond=now.timestamp()
-    
-    if counter < 4:
-      lastSecond = currentSecond
-      continue
+
   
     if str(line).find("Clock") == -1:
       print(line)
       continue
-    
+
+    now = datetime.now()
+    currentSecond=now.timestamp()
+
+    if lastSecond == None:
+      lastSecond = currentSecond
+      continue
+  
     currentTickWidth = currentSecond - lastSecond
     currentBpm = tickWidth2Bpm(currentTickWidth)
 

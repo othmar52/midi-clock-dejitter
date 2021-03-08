@@ -3,7 +3,7 @@
 
 // instead of using RX, TX pins of hardware serial use different pins
 // so we are able to use the debug monitor
-// #define USE_SOFTWARE_SERIAL_PIN_2_3
+#define USE_SOFTWARE_SERIAL_PIN_2_3
 
 #define USE_LCD
 
@@ -31,25 +31,24 @@ const int8_t ppqn = 24;
 bool weHaveADebouncedTempo = false;
 
 // incoming (jittered) clock
-int8_t inClockQuarterBarTickCounter = 0; // loops from 0 to 24 (ppqn)
-uint32_t inClockLastQuarterBarStart = 0;
-uint32_t inClockTickCounter = 0;
-int8_t inClockFullBarTickCounter = 0;    // loops from 0 to 96 (4*ppqn)
+uint8_t inClockQuarterBarTickCounter = 0;  // [tickNum] loops from 0 to 24 (ppqn)
+uint32_t inClockLastQuarterBarStart = 0;   // [microseconds]
+uint32_t inClockTickCounter = 0;           // [tickNum] incremental counter since last clock start
+uint8_t inClockFullBarTickCounter = 0;     // loops from 0 to 96 (4*ppqn)
 
 // outgoing (dejittered) clock
-int32_t outClockFullBarTickCounter = 0;   // loops from 0 to 96 (4*ppqn)
-uint32_t outClockLastFullBarStart = 0;
-uint32_t outClockTickCounter = 0;
+uint8_t outClockFullBarTickCounter = 0;    // [tickNum] loops from 0 to 96 (4*ppqn)
+uint32_t outClockLastFullBarStart = 0;     // [microseconds]
+uint32_t outClockTickCounter = 0;          // [tickNum] incremental counter since last clock start
+uint32_t outClockLastSentTick = 0;         // [microseconds]
 
-uint32_t outClockLastSentTick = 0;
+uint32_t scheduledNextTickMicroSecond = 0; // [microseconds]
 
-uint32_t scheduledNextTickMicroSecond = 0;
+const uint8_t tickDriftTreshold = 2;       // [tickNum]
+int32_t inOutTickDrift = 0;                // [tickNum]
+int32_t driftingTickWidth = 0;             // [microseconds]
 
-const uint8_t tickDriftTreshold = 2;
-int32_t inOutDickDrift = 0;
-int32_t driftingTickWidth = 0;
-
-float currentTempo = 0.0;
+float currentTempo = .0;                  // [BPM]
 
 // incoming serial data
 int incomingByte = 0;
@@ -67,15 +66,15 @@ RunningMedian recentDebouncedTickWidths = RunningMedian(10);
 
 // positive = send later than recieve
 // negative = send before recieve
-const int16_t clockDelayMilliseconds = -30;
+const int16_t clockDelayMilliseconds = 0; // [milliseconds]  // 2051 =~ 1 bar @ 117 BPM
 
-const int8_t softTickNumTreshold = 5;
-const int16_t softCorrectionMicros = 300;
+int32_t forcedTickDeltaOfClockDelay = 0;
+
 
 bool weAreToSlow = false;
 bool weAreToFast = false;
 #ifndef USE_SOFTWARE_SERIAL_PIN_2_3
-// rename "Serial" to "MIDI "to can use different configurations without renaming variables
+// rename "Serial" to "MIDI" to be able to use different sketch configurations without renaming variables
 HardwareSerial & MIDI = Serial;
 #endif
 
@@ -83,7 +82,7 @@ HardwareSerial & MIDI = Serial;
 void setup() {
 #ifdef USE_SOFTWARE_SERIAL_PIN_2_3
   Serial.begin(115200);
-  Serial.println("starting serial with debug monitor....");
+  Serial.println("starting serial with debug monitor MIDI RX/TX pins are 2/3");
 #endif
   MIDI.begin(31250);
  
@@ -132,7 +131,8 @@ void resetJitterHelperVariables() {
 
   debouncedTickWidth = 0;
 
-  currentTempo = 0.0;
+  currentTempo = .0;
+  forcedTickDeltaOfClockDelay = 0;
 
 }
 
@@ -164,6 +164,13 @@ void handleMidiEventClock() {
     }
     recentDebouncedTickWidths.add(recentQuarterBarDurations.getAverage()/ppqn);
     debouncedTickWidth = recentDebouncedTickWidths.getAverage();
+    if (clockDelayMilliseconds != 0) {
+      forcedTickDeltaOfClockDelay = (int32_t)(((float)clockDelayMilliseconds*1000)/(float)debouncedTickWidth);
+      //debug(String(forcedTickDeltaOfClockDelay));
+      //debug(String(clockDelayMilliseconds));
+      //debug(String(debouncedTickWidth));
+      //debug("------------");
+    }
     currentTempo = tickWidthToBpm(debouncedTickWidth);
     inClockQuarterBarTickCounter = 0;
     inClockLastQuarterBarStart = currentMicros;
@@ -203,7 +210,7 @@ void checkSendOutClockTick() {
     return;
   }
   
-  if( currentMicros - outClockLastSentTick < maxBpmTickWidth) {
+  if (currentMicros - outClockLastSentTick < maxBpmTickWidth) {
     // never send a tempo faster than 312 BPM
     //MIDI.write(0xFF);  // sestem reset - for debugging over serial...
     return;
@@ -239,37 +246,61 @@ void sendClockTick() {
   //scheduleNextTick();
   // without any drift next tick has to be sent in debouncedTickWidth microseconds
   scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*debouncedTickWidth);
+  applyClockDelay();
 
   if (inClockTickCounter > (outClockTickCounter + tickDriftTreshold)) {
-    // we are behind. lets remove a little time of scheduled next tick by increasing the tempo
-    inOutDickDrift = inClockTickCounter - outClockTickCounter;
+    // we are behind. lets remove a little time of scheduled next tick by increasing the tempo by <driftAmount> BPM
+    inOutTickDrift = inClockTickCounter - outClockTickCounter;
 
-    driftingTickWidth = bpmToTickWidth((float)(currentTempo + inOutDickDrift));
+    driftingTickWidth = bpmToTickWidth((float)(currentTempo + inOutTickDrift));
 
     scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*driftingTickWidth);
+    applyClockDelay();
 
     //scheduledNextTickMicroSecond = 10;
-    //scheduledNextTickMicroSecond -= (inOutDickDrift * (debouncedTickWidth/inOutDickDrift));
-    MIDI.write(0xFB);  // continue  (just for debuggung over serial visible in aseqdump)
+    //scheduledNextTickMicroSecond -= (inOutTickDrift * (debouncedTickWidth/inOutTickDrift));
+    // MIDI.write(0xFB);  // continue  (just for debuggung over serial visible in aseqdump)
+
+    // pseudo debugging to see the drift in the output of aseqdump (./monitor-midi-clock-jitter.py)
+    MIDI.write(0x90); // MIDI Note-on; channel 1
+    MIDI.write(60); // MIDI note pitch 60
+    MIDI.write(inOutTickDrift); // MIDI note velocity inOutTickDrift
+    
     return;
   }
 
   if (outClockTickCounter > (inClockTickCounter + tickDriftTreshold)) {
-    // our in out tick drift is tooo large (we are to fast)
-    // add a little time to te schedule
+    // our in out tick drift is tooo large (we are ahead)
+    // add a little time to the schedule by decreasing the tempo by <driftAmount> BPM
     
-    inOutDickDrift = outClockTickCounter - inClockTickCounter;
+    inOutTickDrift = outClockTickCounter - inClockTickCounter;
 
-    driftingTickWidth = (inOutDickDrift > currentTempo)
+    driftingTickWidth = (inOutTickDrift > currentTempo)
       ? minBpmTickWidth
-      : bpmToTickWidth((float)(currentTempo - inOutDickDrift));
+      : bpmToTickWidth((float)(currentTempo - inOutTickDrift));
 
     scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*driftingTickWidth);
+    applyClockDelay();
     
-    //scheduledNextTickMicroSecond += (inOutDickDrift * (debouncedTickWidth/inOutDickDrift));
-    MIDI.write(0xFE);  // active sensing  (just for debuggung over serial visible in aseqdump)
+    //MIDI.write(0xFE);  // active sensing  (just for debuggung over serial visible in aseqdump)
+
+    // pseudo debugging to see the drift in the output of aseqdump (./monitor-midi-clock-jitter.py)
+    MIDI.write(0x90); // MIDI Note-on; channel 1
+    MIDI.write(20);   // MIDI note pitch 20
+    MIDI.write(inOutTickDrift); // MIDI note velocity inOutTickDrift
   }
-  
+}
+
+void applyClockDelay() {
+  if (clockDelayMilliseconds == 0) {
+    return;
+  }
+  if (clockDelayMilliseconds < 0) {
+    if(currentMicros < clockDelayMilliseconds * -1000) {
+      return;
+    }
+  }
+  scheduledNextTickMicroSecond += (clockDelayMilliseconds*1000);
 }
 
 /**
