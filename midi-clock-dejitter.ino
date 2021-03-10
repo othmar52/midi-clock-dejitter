@@ -1,12 +1,19 @@
  
+
+// thanks to https://github.com/RobTillaart/RunningMedian
+// this is very comfortable for debouncing the incoming tempo
 #include "RunningMedian.h"
 
 // instead of using RX, TX pins of hardware serial use different pins
 // so we are able to use the debug monitor
 //#define USE_SOFTWARE_SERIAL_PIN_2_3
 
+// thanks to https://github.com/arduino-libraries/LiquidCrystal
+// in this sketch a LCD1602 (16 chars x 2 lines) is used
 #define USE_LCD
 
+// thanks to https://github.com/FortySevenEffects/arduino_midi_library
+// but as long as we recieve or send only three different bytes (start, stop, tick) there is no need to use such an overhead
 //#define USE_MIDI_LIBRARY
 
 #ifdef USE_MIDI_LIBRARY
@@ -78,11 +85,9 @@ const int16_t clockDelayMilliseconds = 0; // [milliseconds]  // 2051 =~ 1 bar @ 
 
 int32_t forcedTickDeltaOfClockDelay = 0;
 
-#ifndef USE_SOFTWARE_SERIAL_PIN_2_3
+#if !defined(USE_SOFTWARE_SERIAL_PIN_2_3) && !defined(USE_MIDI_LIBRARY)
 // rename "Serial" to "MIDI" to be able to use different sketch configurations without renaming variables
-#ifndef USE_MIDI_LIBRARY
 HardwareSerial & MIDI = Serial;
-#endif
 #endif
 
 
@@ -91,28 +96,31 @@ void setup() {
   Serial.begin(115200);
   Serial.println("starting serial with debug monitor MIDI RX/TX pins are 2/3");
 #endif
+
 #ifndef USE_MIDI_LIBRARY
   MIDI.begin(31250);
 #else
   MIDI.begin(MIDI_CHANNEL_OMNI); // Launch MIDI, by default listening to all channels
   MIDI.turnThruOff(); // we have to avoid clock ticks beeing sent thru
   MIDI.setHandleClock(handleMidiEventClock);
+  MIDI.setHandleTick(handleMidiEventClock);
   MIDI.setHandleStop(handleMidiEventStop);
   MIDI.setHandleStart(handleMidiEventStart);
 #endif
+
 #ifdef USE_LCD
   lcd.begin(16, 2);
   lcd.print("hi");
 #endif
-
 }
 
 void loop() {
   currentMicros = micros();
+
 #ifdef USE_MIDI_LIBRARY
+  // midi library uses callbacks defined in setup()
   MIDI.read();
-#endif
-#ifndef USE_MIDI_LIBRARY
+#else
   // manually read incoming bytes from serial
   if (MIDI.available()) {
     int incomingByte = MIDI.read();
@@ -127,11 +135,11 @@ void loop() {
     }
   }
 #endif
+
   checkSendOutClockTick();
 }
 
 void resetJitterHelperVariables() {
-  
   inClockQuarterBarTickCounter = 0;
   inClockLastQuarterBarStart = 0;
   inClockTickCounter = 0;
@@ -152,7 +160,6 @@ void resetJitterHelperVariables() {
 
   currentTempo = .0;
   forcedTickDeltaOfClockDelay = 0;
-
 }
 
 void handleMidiEventTick() {
@@ -183,17 +190,15 @@ void handleMidiEventClock() {
     currentTempo = tickWidthToBpm(debouncedTickWidth);
     recentDebouncedBpm.add(currentTempo);
     if (clockDelayMilliseconds != 0) {
+      // difference between incoming and outgoing ticks as is maybe on purpose caused by configured clockDelayMilliseconds
       forcedTickDeltaOfClockDelay = (int32_t)(((float)clockDelayMilliseconds*1000)/(float)debouncedTickWidth);
-      //debug(String(forcedTickDeltaOfClockDelay));
-      //debug(String(clockDelayMilliseconds));
-      //debug(String(debouncedTickWidth));
-      //debug("------------");
     }
     inClockQuarterBarTickCounter = 0;
     inClockLastQuarterBarStart = currentMicros;
 
 #ifdef USE_LCD
     if (inClockFullBarTickCounter % (2*ppqn) == 0) {
+      // send some debug informations to attached LCD with a refresh rate of 0.5 bars (48 ticks)
       lcd.clear();
       lcd.setCursor(0,0);
       lcd.print(String(inClockTickCounter) + " i " + String(currentTempo) + "bpm");
@@ -234,7 +239,6 @@ void checkSendOutClockTick() {
   }
 
   sendClockTick();
- 
 }
 
 /**
@@ -262,7 +266,7 @@ void sendClockTick() {
 #else USE_MIDI_LIBRARY
   MIDI.write(0xF8);
 #endif
-  //scheduleNextTick();
+
   // without any drift next tick has to be sent in debouncedTickWidth microseconds
   scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*debouncedTickWidth);
   applyClockDelay();
@@ -315,10 +319,12 @@ void sendClockTick() {
 
 void applyClockDelay() {
   if (clockDelayMilliseconds == 0) {
+    // no need to apply any offset for the next tick
     return;
   }
   if (clockDelayMilliseconds < 0) {
     if(currentMicros < clockDelayMilliseconds * -1000) {
+      // we cant apply a negative offset until we have reached this time
       return;
     }
   }
@@ -360,7 +366,7 @@ void handleMidiEventStop() {
 
 float tickWidthToBpm(int32_t tickWidth)
 {
-  // calculate interval of clock tick[microseconds] (24 ppqn)
+  // calculate tempo [BPM] based on tick width [microseconds]
   if (tickWidth < 1) {
     return 0;
   }
