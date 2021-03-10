@@ -3,7 +3,7 @@
 
 // instead of using RX, TX pins of hardware serial use different pins
 // so we are able to use the debug monitor
-#define USE_SOFTWARE_SERIAL_PIN_2_3
+//#define USE_SOFTWARE_SERIAL_PIN_2_3
 
 #define USE_LCD
 
@@ -62,6 +62,7 @@ const uint16_t maxBpmTickWidth = 8000;  // [microseconds] =~ 312 BPM
 int32_t debouncedTickWidth = 0;
 RunningMedian recentQuarterBarDurations = RunningMedian(10);
 RunningMedian recentDebouncedTickWidths = RunningMedian(10);
+RunningMedian recentDebouncedBpm = RunningMedian(10);
 
 
 // positive = send later than recieve
@@ -128,6 +129,7 @@ void resetJitterHelperVariables() {
   
   recentQuarterBarDurations.clear();
   recentDebouncedTickWidths.clear();
+  recentDebouncedBpm.clear();
 
   debouncedTickWidth = 0;
 
@@ -158,12 +160,14 @@ void handleMidiEventClock() {
   if (inClockQuarterBarTickCounter == ppqn) {
     //debug("----------------- quarter note clock IN ----------------");
     recentQuarterBarDurations.add(currentMicros - inClockLastQuarterBarStart);
-    if(recentDebouncedTickWidths.getHighest() - recentDebouncedTickWidths.getLowest() > 2000) {
-      // obviously we had a drastic tempo change
+    if(recentDebouncedBpm.getHighest() - recentDebouncedBpm.getLowest() > 5) {
+      // obviously there had been a huge tempo change
       recentDebouncedTickWidths.clear();
     }
     recentDebouncedTickWidths.add(recentQuarterBarDurations.getAverage()/ppqn);
     debouncedTickWidth = recentDebouncedTickWidths.getAverage();
+    currentTempo = tickWidthToBpm(debouncedTickWidth);
+    recentDebouncedBpm.add(currentTempo);
     if (clockDelayMilliseconds != 0) {
       forcedTickDeltaOfClockDelay = (int32_t)(((float)clockDelayMilliseconds*1000)/(float)debouncedTickWidth);
       //debug(String(forcedTickDeltaOfClockDelay));
@@ -171,7 +175,6 @@ void handleMidiEventClock() {
       //debug(String(debouncedTickWidth));
       //debug("------------");
     }
-    currentTempo = tickWidthToBpm(debouncedTickWidth);
     inClockQuarterBarTickCounter = 0;
     inClockLastQuarterBarStart = currentMicros;
 
@@ -182,13 +185,14 @@ void handleMidiEventClock() {
       lcd.print(String(inClockTickCounter) + " i " + String(currentTempo) + "bpm");
       lcd.setCursor(0,1);
       int32_t diff = outClockTickCounter - inClockTickCounter;
-      lcd.print(String(outClockTickCounter) + " o "+ String(diff));
+      lcd.print(String(outClockTickCounter) + " o "+ String(diff)  + " " + String(forcedTickDeltaOfClockDelay));
     }
 #endif
 
   }
 
   if (weHaveADebouncedTempo == false) {
+    // pass thru the jittering ticks until we know the tempo
     sendClockTick();
   }
 }
@@ -231,6 +235,12 @@ int32_t correctionDelta = 0;
  * really send the tick and calculate the time when the next tick has to be sent
  */
 void sendClockTick() {
+
+  if (forcedTickDeltaOfClockDelay < 0 && inClockTickCounter < abs(forcedTickDeltaOfClockDelay)) {
+    // do not send out ticks if we have a configered negative clock offset (send later than recieve)
+    return;
+  }
+
   if (outClockTickCounter == 0) {
     outClockLastFullBarStart = currentMicros;
   }
@@ -241,18 +251,23 @@ void sendClockTick() {
     outClockLastFullBarStart = currentMicros;
     outClockFullBarTickCounter = 0;
   }
-  //MIDI.sendClock();
+#ifdef USE_MIDI_LIBRARY
+  MIDI.sendClock();
+#endif
+#ifndef USE_MIDI_LIBRARY
   MIDI.write(0xF8);
+#endif
   //scheduleNextTick();
   // without any drift next tick has to be sent in debouncedTickWidth microseconds
   scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*debouncedTickWidth);
   applyClockDelay();
 
-  if (inClockTickCounter > (outClockTickCounter + tickDriftTreshold)) {
+  if (inClockTickCounter > (outClockTickCounter + tickDriftTreshold + forcedTickDeltaOfClockDelay)) {
     // we are behind. lets remove a little time of scheduled next tick by increasing the tempo by <driftAmount> BPM
-    inOutTickDrift = inClockTickCounter - outClockTickCounter;
+    inOutTickDrift = inClockTickCounter - outClockTickCounter + forcedTickDeltaOfClockDelay;
 
     driftingTickWidth = bpmToTickWidth((float)(currentTempo + inOutTickDrift));
+    debug("driftingTickWidth [behind] " + String(driftingTickWidth) + " " + String(debouncedTickWidth));
 
     scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*driftingTickWidth);
     applyClockDelay();
@@ -269,15 +284,17 @@ void sendClockTick() {
     return;
   }
 
-  if (outClockTickCounter > (inClockTickCounter + tickDriftTreshold)) {
+  if (outClockTickCounter > (inClockTickCounter + tickDriftTreshold + forcedTickDeltaOfClockDelay)) {
     // our in out tick drift is tooo large (we are ahead)
     // add a little time to the schedule by decreasing the tempo by <driftAmount> BPM
     
-    inOutTickDrift = outClockTickCounter - inClockTickCounter;
+    inOutTickDrift = outClockTickCounter - inClockTickCounter + forcedTickDeltaOfClockDelay;
 
     driftingTickWidth = (inOutTickDrift > currentTempo)
       ? minBpmTickWidth
       : bpmToTickWidth((float)(currentTempo - inOutTickDrift));
+
+    debug("driftingTickWidth [ahead] " + String(driftingTickWidth) + " " + String(debouncedTickWidth));
 
     scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*driftingTickWidth);
     applyClockDelay();
