@@ -24,6 +24,13 @@ LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
 #ifdef USE_SOFTWARE_SERIAL_PIN_2_3
 #include <SoftwareSerial.h>
 SoftwareSerial MIDI(2, 3); // RX, TX
+#ifdef USE_MIDI_LIBRARY
+MIDI_CREATE_INSTANCE(SoftwareSerial, softSerial, MIDI);
+#endif
+#else
+#ifdef USE_MIDI_LIBRARY
+MIDI_CREATE_DEFAULT_INSTANCE();
+#endif
 #endif
 
 uint32_t currentMicros = 0;
@@ -73,7 +80,9 @@ int32_t forcedTickDeltaOfClockDelay = 0;
 
 #ifndef USE_SOFTWARE_SERIAL_PIN_2_3
 // rename "Serial" to "MIDI" to be able to use different sketch configurations without renaming variables
+#ifndef USE_MIDI_LIBRARY
 HardwareSerial & MIDI = Serial;
+#endif
 #endif
 
 
@@ -82,8 +91,15 @@ void setup() {
   Serial.begin(115200);
   Serial.println("starting serial with debug monitor MIDI RX/TX pins are 2/3");
 #endif
+#ifndef USE_MIDI_LIBRARY
   MIDI.begin(31250);
- 
+#else
+  MIDI.begin(MIDI_CHANNEL_OMNI); // Launch MIDI, by default listening to all channels
+  MIDI.turnThruOff(); // we have to avoid clock ticks beeing sent thru
+  MIDI.setHandleClock(handleMidiEventClock);
+  MIDI.setHandleStop(handleMidiEventStop);
+  MIDI.setHandleStart(handleMidiEventStart);
+#endif
 #ifdef USE_LCD
   lcd.begin(16, 2);
   lcd.print("hi");
@@ -93,6 +109,11 @@ void setup() {
 
 void loop() {
   currentMicros = micros();
+#ifdef USE_MIDI_LIBRARY
+  MIDI.read();
+#endif
+#ifndef USE_MIDI_LIBRARY
+  // manually read incoming bytes from serial
   if (MIDI.available()) {
     int incomingByte = MIDI.read();
     if (incomingByte == 0xF8) {
@@ -105,8 +126,7 @@ void loop() {
       handleMidiEventStop();
     }
   }
-  
-  //MIDI.read();
+#endif
   checkSendOutClockTick();
 }
 
@@ -144,15 +164,11 @@ void handleMidiEventTick() {
  * we got a clock tick from incoming clock
  */
 void handleMidiEventClock() {
-  //MIDI.sendClock();
-  //softSerial.write(0xF8);
-  //return;
   inClockTickCounter+=1;
   inClockQuarterBarTickCounter+=1;
   inClockFullBarTickCounter+=1;
   if (inClockFullBarTickCounter == ppqn * 4) {
     inClockFullBarTickCounter = 0;
-    weHaveADebouncedTempo = true;
   }
   if (inClockQuarterBarTickCounter == ppqn) {
     //debug("----------------- quarter note clock IN ----------------");
@@ -163,6 +179,7 @@ void handleMidiEventClock() {
     }
     recentDebouncedTickWidths.add(recentQuarterBarDurations.getAverage()/ppqn);
     debouncedTickWidth = recentDebouncedTickWidths.getAverage();
+    weHaveADebouncedTempo = true;
     currentTempo = tickWidthToBpm(debouncedTickWidth);
     recentDebouncedBpm.add(currentTempo);
     if (clockDelayMilliseconds != 0) {
@@ -242,8 +259,7 @@ void sendClockTick() {
   }
 #ifdef USE_MIDI_LIBRARY
   MIDI.sendClock();
-#endif
-#ifndef USE_MIDI_LIBRARY
+#else USE_MIDI_LIBRARY
   MIDI.write(0xF8);
 #endif
   //scheduleNextTick();
@@ -311,8 +327,11 @@ void applyClockDelay() {
 
 void handleMidiEventStart() {
   resetJitterHelperVariables();
-  //MIDI.sendStart();
+#ifdef USE_MIDI_LIBRARY
+  MIDI.sendStart();
+#else
   MIDI.write(0xFA);
+#endif
   inClockLastQuarterBarStart = currentMicros;
 #ifdef USE_LCD
       lcd.clear();
@@ -322,8 +341,11 @@ void handleMidiEventStart() {
 }
 
 void handleMidiEventStop() {
-  //MIDI.sendStop();
+#ifdef USE_MIDI_LIBRARY
+  MIDI.sendStop();
+#else
   MIDI.write(0xFC);
+#endif
   
   resetJitterHelperVariables();
   // most clocks also send ticks during stop
