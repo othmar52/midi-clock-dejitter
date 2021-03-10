@@ -13,7 +13,16 @@ previousMs=0
 
 ppqn = 24
 
-metronome = False
+metronome = True
+samplePathBeat = 'tick1.wav'
+samplePathBar = 'tick2.wav'
+
+def playSound(samplePath):
+  if metronome != True:
+    return
+  pygame.mixer.music.load(samplePath)
+  pygame.mixer.music.play()
+
 
 def main():
   print ('hello')
@@ -21,36 +30,44 @@ def main():
   lastSecond = None
   counter = 0
   tickCounter = 0;
+  counterBars = 1;
+  counterBeats = 0;
   minBpm = None
   maxBpm = None
   
   pygame.mixer.init()
-  pygame.mixer.music.load("tick1.wav")
 
   while True:
     line = process.stdout.readline()
     if not line:
       break
     counter += 1
-
   
-    if str(line).find("Stop") > 0:
+    if str(line).find('Stop') > 0:
       tickCounter = 0
-  
-    if str(line).find("Start") > 0:
-      pygame.mixer.music.load("tick2.wav")
-      pygame.mixer.music.play()
-      tickCounter = 0
+      counterBeats = 0
+      counterBars = 1
+      print(line)
+      print ('001.1.01')
       continue
   
-    if str(line).find("Clock") == -1:
+    if str(line).find('Start') > 0:
+      playSound(samplePathBar)
+      tickCounter = 0
+      counterBeats = 0
+      counterBars = 1
+      print(line)
+      print ('001.1.01')
+      continue
+  
+    if str(line).find('Clock') == -1:
       print(line)
       continue
 
 
     tickCounter += 1
     now = datetime.now()
-    currentSecond=now.timestamp()
+    currentSecond = now.timestamp()
 
     if lastSecond == None:
       lastSecond = currentSecond
@@ -68,32 +85,28 @@ def main():
       minBpm = currentBpm
     if maxBpm < currentBpm:
       maxBpm = currentBpm
-    #the real code does filtering here
-    print (f'aa {"{:10.2f}".format(currentBpm)} {"{:10.2f}".format(minBpm)} {"{:10.2f}".format(maxBpm)}')
+      
+
+    if tickCounter % ppqn == 0:
+      samplePath = samplePathBeat
+      counterBeats += 1
+      if tickCounter % (ppqn*4) == 0:
+        samplePath = samplePathBar
+        counterBars += 1
+      playSound(samplePath)
+
+    print (f'{counterBars:03}.{counterBeats % 4 + 1}.{(tickCounter % ppqn + 1):02} {"{:10.2f}".format(currentBpm)} {"{:10.2f}".format(minBpm)} {"{:10.2f}".format(maxBpm)}')
     lastSecond = currentSecond
 
     if counter > 200:
       minBpm = None
       maxBpm = None
       counter = 4
-    
-    if metronome != True:
-        continue
-
-    if tickCounter % ppqn == 0:
-        samplePath = "tick1.wav"
-        if tickCounter % (ppqn*4) == 0:
-            samplePath = "tick2.wav"
-
-        pygame.mixer.music.load(samplePath)
-        pygame.mixer.music.play()
-
-
 
 
 def tickWidth2Bpm(tickWidth):
   return 60 / (tickWidth * ppqn)
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+  main()
