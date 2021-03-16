@@ -60,6 +60,10 @@ def main():
       print ('001.1.01')
       continue
   
+  
+    if str(line).find('Active Sensing') > 0:
+      continue
+
     if str(line).find('Clock') == -1:
       print(line)
       continue
