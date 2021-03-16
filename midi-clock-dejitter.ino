@@ -1,27 +1,42 @@
  
+// midi-clock-dejitter / clock stabilizer for Arduino
+//
+// Original Created by audeonic
+// ported to Arduino by othmar52
+// @see https://github.com/othmar52/midi-clock-dejitter
 
-// thanks to https://github.com/RobTillaart/RunningMedian
-// this is very comfortable for debouncing the incoming tempo
-#include "RunningMedian.h"
 
+// alternative wiring for debugging
+//
 // instead of using RX, TX pins of hardware serial use different pins
-// so we are able to use the debug monitor
+// so we are able to use the debug monitor of Arduino IDE
 //#define USE_SOFTWARE_SERIAL_PIN_2_3
 
+// alternative debugging via LCD display 16 x 2
+//
 // thanks to https://github.com/arduino-libraries/LiquidCrystal
 // in this sketch a LCD1602 (16 chars x 2 lines) is used
-#define USE_LCD
+//#define USE_LCD1602
 
+
+// alternative usage of arduino midi library
+//
+// in case you want to implement some more midi magic to your sketch this
+// library may be useful. but as long as we recieve or send only three
+// different bytes (start, stop, tick) there is no need to use such an overhead
 // thanks to https://github.com/FortySevenEffects/arduino_midi_library
-// but as long as we recieve or send only three different bytes (start, stop, tick) there is no need to use such an overhead
 //#define USE_MIDI_LIBRARY
 
 #ifdef USE_MIDI_LIBRARY
 #include <MIDI.h>
 #endif
 
+#if defined(USE_SOFTWARE_SERIAL_PIN_2_3) || defined(USE_LCD1602)
+// thanks to https://github.com/yoursunny/PriUint64
+#include "PriUint64.h"
+#endif
 
-#ifdef USE_LCD
+#ifdef USE_LCD1602
 #include <LiquidCrystal.h>
 const int rs = 12, en = 11, d4 = 7, d5 = 6, d6 = 5, d7 = 4;
 LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
@@ -30,9 +45,11 @@ LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
 
 #ifdef USE_SOFTWARE_SERIAL_PIN_2_3
 #include <SoftwareSerial.h>
-SoftwareSerial MIDI(2, 3); // RX, TX
 #ifdef USE_MIDI_LIBRARY
+SoftwareSerial softSerial(2, 3); // RX, TX
 MIDI_CREATE_INSTANCE(SoftwareSerial, softSerial, MIDI);
+#else
+SoftwareSerial MIDI(2, 3); // RX, TX
 #endif
 #else
 #ifdef USE_MIDI_LIBRARY
@@ -40,50 +57,76 @@ MIDI_CREATE_DEFAULT_INSTANCE();
 #endif
 #endif
 
-uint32_t currentMicros = 0;
-const int8_t ppqn = 24;
-bool weHaveADebouncedTempo = false;
+#define PPQN 24
 
-// incoming (jittered) clock
-uint8_t inClockQuarterBarTickCounter = 0;  // [tickNum] loops from 0 to 24 (ppqn)
-uint32_t inClockLastQuarterBarStart = 0;   // [microseconds]
-uint32_t inClockTickCounter = 0;           // [tickNum] incremental counter since last clock start
-uint8_t inClockFullBarTickCounter = 0;     // loops from 0 to 96 (4*ppqn)
+uint64_t currentMicros = 0;
 
-// outgoing (dejittered) clock
-uint8_t outClockFullBarTickCounter = 0;    // [tickNum] loops from 0 to 96 (4*ppqn)
-uint32_t outClockLastFullBarStart = 0;     // [microseconds]
-uint32_t outClockTickCounter = 0;          // [tickNum] incremental counter since last clock start
-uint32_t outClockLastSentTick = 0;         // [microseconds]
+uint64_t inClockTotalTickCount = 0;  // [tick] incremental counter incoming ticks after start
+uint64_t inClockLastStartMicros = 0; // timestamp very first in tick
+uint64_t inClockLastTickMicros = 0;  // microsecond of last incoming tick
 
-uint32_t scheduledNextTickMicroSecond = 0; // [microseconds]
+uint64_t outClockTickIntervalMicros = 0;    // [microsecond]
+static uint64_t outClockTotalTickCount = 0; // [tick] incremental counter sended ticks after start
+uint64_t outClockLastTickMicros = 0;        // [microsecond]
+float outClockTempoRoundingFactor = .0;     // for displaying the out clock tempo
 
-const uint8_t tickDriftTreshold = 2;       // [tickNum]
-int32_t inOutTickDrift = 0;                // [tickNum]
-int32_t driftingTickWidth = 0;             // [microseconds]
+float tempoDeviationBpm;            // [BPM] deviation of IN/OUT tempo
 
-float currentTempo = .0;                  // [BPM]
+uint16_t inClockDebouncerAverageCount = 0;          // [tick]
+uint64_t inClockDebouncerAverageIntervalMicros = 0; // [microsecond]
+uint16_t inClockDebouncerAverageCountMax = 0;       // [tick]
+uint8_t inClockDebouncerCycleTicks = 0;             // [tick]
+int32_t inClockDebouncerCycleMod = 0;               // [tick]
 
-// incoming serial data
-int incomingByte = 0;
+float debouncerTolerance = .0;
 
-
-const uint16_t minBpmTickWidth = 65000; // [microseconds] =~ 38 BPM
-const uint16_t maxBpmTickWidth = 8000;  // [microseconds] =~ 312 BPM
+uint64_t schedulerReferenceTickNum = 0;      // [tick]
+uint64_t schedulerReferenceTickMicros = 0;   // [microsecond]
+uint64_t schedulerReferenceTickInterval = 0; // [microsecond]
 
 
-// helper variables for debouncing incoming tempo
-int32_t debouncedTickWidth = 0;
-RunningMedian recentQuarterBarDurations = RunningMedian(10);
-RunningMedian recentDebouncedTickWidths = RunningMedian(10);
-RunningMedian recentDebouncedBpm = RunningMedian(10);
-
-
-// positive = send later than recieve
+// positive = send later than recieve  !!!DANGER!!! positive value not supported yet
 // negative = send before recieve
-const int16_t clockDelayMilliseconds = 0; // [milliseconds]  // 2051 =~ 1 bar @ 117 BPM
+const int32_t clockDelayMillis = 0; // [milliseconds]  // 2051 =~ 1 bar @ 117 BPM
 
-int32_t forcedTickDeltaOfClockDelay = 0;
+
+double sensitivity = 2;
+
+/*
+ *   taken from https://audeonic.com/midipace/
+ *   ---------------------------------------------------------------------
+ *   sensitivity   deviation        BPM rounding          Rounding factor
+ *   ---------------------------------------------------------------------
+ *   0.25          +/- 0.01 bpm     nearest 0.01 bpm         100
+ *   0.5           +/- 0.025 bpm    nearest 0.05 bpm          20
+ *   1             +/- 0.05 bpm     nearest 0.1 bpm           10
+ *   2             +/- 0.25 bpm     nearest 0.5 bpm            2
+ *   4             +/- 0.5 bpm      nearest 1.0 bpm            1
+ *   8             +/- 2.5 bpm      nearest 5.0 bpm            0.2
+ *   16            +/- 5.0 bpm      nearest 10.0 bpm           0.1
+ */
+void setSensitivity() {
+  // set the defaults of sensitivity = 2
+  outClockTempoRoundingFactor = 2.0;
+  debouncerTolerance = .25;
+  
+  // TODO switch..case possible with double??
+  if (sensitivity == 16) {  outClockTempoRoundingFactor =    .2; debouncerTolerance = 2.5;   }
+  if (sensitivity == 8) {   outClockTempoRoundingFactor =    .1; debouncerTolerance = 5.0;   }
+  if (sensitivity == 4) {   outClockTempoRoundingFactor =   1;   debouncerTolerance =  .5;   }
+  if (sensitivity == 2) {   outClockTempoRoundingFactor =   2.0; debouncerTolerance =  .25;  }
+  if (sensitivity == 1) {   outClockTempoRoundingFactor =  10.0; debouncerTolerance =  .05;  }
+  if (sensitivity == .5) {  outClockTempoRoundingFactor =  20.0; debouncerTolerance =  .025; }
+  if (sensitivity == .25) { outClockTempoRoundingFactor = 100.0; debouncerTolerance =  .01;  }
+
+  inClockDebouncerCycleTicks = sensitivity * PPQN;
+
+  // cycle mod is 2/3 of a cycle or 24 ticks if distributing
+  inClockDebouncerCycleMod = (inClockDebouncerCycleTicks ? inClockDebouncerCycleTicks / 3 * 2 - 1 : PPQN);
+  inClockDebouncerAverageCountMax = (inClockDebouncerCycleTicks ? inClockDebouncerCycleTicks : PPQN);
+}
+
+
 
 #if !defined(USE_SOFTWARE_SERIAL_PIN_2_3) && !defined(USE_MIDI_LIBRARY)
 // rename "Serial" to "MIDI" to be able to use different sketch configurations without renaming variables
@@ -94,7 +137,8 @@ HardwareSerial & MIDI = Serial;
 void setup() {
 #ifdef USE_SOFTWARE_SERIAL_PIN_2_3
   Serial.begin(115200);
-  Serial.println("starting serial with debug monitor MIDI RX/TX pins are 2/3");
+  Serial.println("starting serial with debug monitor");
+  Serial.println("MIDI RX/TX pins are 2/3");
 #endif
 
 #ifndef USE_MIDI_LIBRARY
@@ -108,10 +152,11 @@ void setup() {
   MIDI.setHandleStart(handleMidiEventStart);
 #endif
 
-#ifdef USE_LCD
+#ifdef USE_LCD1602
   lcd.begin(16, 2);
   lcd.print("hi");
 #endif
+  setSensitivity();
 }
 
 void loop() {
@@ -131,6 +176,7 @@ void loop() {
       handleMidiEventStart();
     }
     if (incomingByte == 0xFC) {
+      // debug("incoming byte is stop");
       handleMidiEventStop();
     }
   }
@@ -140,30 +186,33 @@ void loop() {
 }
 
 void resetJitterHelperVariables() {
-  inClockQuarterBarTickCounter = 0;
-  inClockLastQuarterBarStart = 0;
-  inClockTickCounter = 0;
-  inClockFullBarTickCounter = 0;
+  inClockTotalTickCount = 0;
+  inClockLastStartMicros = 0;
+  inClockLastTickMicros = 0;
+    
+  outClockTickIntervalMicros = 0;
+  outClockTotalTickCount = 0;
+  outClockLastTickMicros = 0;
+  outClockTempoRoundingFactor = .0;
   
-  outClockFullBarTickCounter = 0;
-  outClockLastFullBarStart = 0;
-  outClockTickCounter = 0;
-  outClockLastSentTick = 0;
-  
-  weHaveADebouncedTempo = false;
-  
-  recentQuarterBarDurations.clear();
-  recentDebouncedTickWidths.clear();
-  recentDebouncedBpm.clear();
+  tempoDeviationBpm = 0;
 
-  debouncedTickWidth = 0;
+  inClockDebouncerAverageCount = 0;
+  inClockDebouncerAverageIntervalMicros = 0;
+  inClockDebouncerAverageCountMax = 0;
+  inClockDebouncerCycleTicks = 0;
+  inClockDebouncerCycleMod = 0;
+  debouncerTolerance = .0;
 
-  currentTempo = .0;
-  forcedTickDeltaOfClockDelay = 0;
+  schedulerReferenceTickNum = 0;
+  schedulerReferenceTickMicros = 0;
+  schedulerReferenceTickInterval = 0;
+  
+  setSensitivity();
 }
 
 void handleMidiEventTick() {
-  handleMidiEventClock();
+  handleMidiEventClock(); 
 }
 
 
@@ -171,165 +220,200 @@ void handleMidiEventTick() {
  * we got a clock tick from incoming clock
  */
 void handleMidiEventClock() {
-  inClockTickCounter+=1;
-  inClockQuarterBarTickCounter+=1;
-  inClockFullBarTickCounter+=1;
-  if (inClockFullBarTickCounter == ppqn * 4) {
-    inClockFullBarTickCounter = 0;
+  uint16_t mod = inClockTotalTickCount % inClockDebouncerCycleTicks;
+   
+  // set anchor if tick 0
+  if (inClockTotalTickCount == 0)
+  {
+     inClockLastStartMicros = currentMicros;
   }
-  if (inClockQuarterBarTickCounter == ppqn) {
-    //debug("----------------- quarter note clock IN ----------------");
-    recentQuarterBarDurations.add(currentMicros - inClockLastQuarterBarStart);
-    if(recentDebouncedBpm.getHighest() - recentDebouncedBpm.getLowest() > 5) {
-      // obviously there had been a huge tempo change
-      recentDebouncedTickWidths.clear();
-    }
-    recentDebouncedTickWidths.add(recentQuarterBarDurations.getAverage()/ppqn);
-    debouncedTickWidth = recentDebouncedTickWidths.getAverage();
-    weHaveADebouncedTempo = true;
-    currentTempo = tickWidthToBpm(debouncedTickWidth);
-    recentDebouncedBpm.add(currentTempo);
-    if (clockDelayMilliseconds != 0) {
-      // difference between incoming and outgoing ticks as is maybe on purpose caused by configured clockDelayMilliseconds
-      forcedTickDeltaOfClockDelay = (int32_t)(((float)clockDelayMilliseconds*1000)/(float)debouncedTickWidth);
-    }
-    inClockQuarterBarTickCounter = 0;
-    inClockLastQuarterBarStart = currentMicros;
 
-#ifdef USE_LCD
-    if (inClockFullBarTickCounter % (2*ppqn) == 0) {
-      // send some debug informations to attached LCD with a refresh rate of 0.5 bars (48 ticks)
-      lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print(String(inClockTickCounter) + " i " + String(currentTempo) + "bpm");
-      lcd.setCursor(0,1);
-      int32_t diff = outClockTickCounter - inClockTickCounter;
-      lcd.print(String(outClockTickCounter) + " o "+ String(diff)  + " " + String(forcedTickDeltaOfClockDelay));
-    }
+
+
+  // update incoming average
+  if (inClockTotalTickCount)
+  {
+     // total them up
+     uint64_t sum = inClockDebouncerAverageCount * inClockDebouncerAverageIntervalMicros;
+     
+     // remove extra ticks+1 that we are about to add from sum
+     // (also cater for distribution case)
+     if (inClockDebouncerAverageCount >= inClockDebouncerAverageCountMax)
+     {
+        uint16_t remove = inClockDebouncerAverageCount - inClockDebouncerAverageCountMax + 1;
+        inClockDebouncerAverageCount -= remove;
+        sum -= (inClockDebouncerAverageIntervalMicros * remove);
+     }
+     
+     // add the new interval
+     uint64_t inClockLastInterval = currentMicros - inClockLastTickMicros;
+     sum += inClockLastInterval;
+     inClockDebouncerAverageCount++;
+     
+     // update the average
+     inClockDebouncerAverageIntervalMicros = sum / inClockDebouncerAverageCount;
+    
+#ifdef USE_LCD1602
+     if (inClockTotalTickCount % (inClockDebouncerCycleTicks*4) == 0) {
+       lcd.clear();
+       lcd.setCursor(0,0);
+       lcd.print(PriUint64<DEC>(inClockTotalTickCount));
+       lcd.setCursor(8,0);
+       lcd.print(String(tickWidthToBpm(inClockDebouncerAverageIntervalMicros)));
+       lcd.setCursor(0,1);
+       lcd.print(PriUint64<DEC>(outClockTotalTickCount));
+       lcd.setCursor(8,1);
+       lcd.print(String(tickWidthToBpm(outClockTickIntervalMicros)));
+     }
 #endif
+  }
+
+
+
+  // if tick_count < cycle_ticks then pass these - first tracking cycle
+  // or if we are distributing only
+  if (inClockTotalTickCount < inClockDebouncerCycleTicks || inClockDebouncerCycleTicks == 0)
+  {
+     sendClockTick();
+     
+     if (inClockDebouncerCycleTicks == 0)
+     {
+        // only distributing, so need to manually update in bpm every 24 ticks
+        if (inClockTotalTickCount && (inClockTotalTickCount % inClockDebouncerCycleMod) == 0)
+        {
+           // calculate deviation for distribution
+           float inClockTempo = tickWidthToBpm(inClockDebouncerAverageIntervalMicros);
+           float outClockTempo = (outClockTickIntervalMicros ? tickWidthToBpm(outClockTickIntervalMicros) : inClockTempo);
+           
+           // use out_tick_interval to retain our previous bpm
+           outClockTickIntervalMicros = inClockDebouncerAverageIntervalMicros;
+           
+           // determine deviation in bpm
+           tempoDeviationBpm = fabs(outClockTempo - inClockTempo);
+        }
+        
+        //goto incoming_tick;
+        
+        inClockTotalTickCount++;
+        inClockLastTickMicros = currentMicros;
+        return;
+     }
+  }
+
+
+  // schedule batch of our own cycle_ticks when tick_count % cycle_ticks == 2/3 of a cycle
+  if (mod == inClockDebouncerCycleMod)
+  {         
+     // determine current in/out tempo
+     float inClockTempo = tickWidthToBpm(inClockDebouncerAverageIntervalMicros);
+     float outClockTempo = (outClockTickIntervalMicros ? tickWidthToBpm(outClockTickIntervalMicros) : inClockTempo);
+     
+     // determine deviation in bpm
+     tempoDeviationBpm = fabs(outClockTempo - inClockTempo);
+
+    /*
+    debug("--------- new scheduling cycle begin ------------------");
+    debug("in bpm " + String(inClockTempo));
+    debug("out bpm " + String(outClockTempo));
+    debug("tempoDeviationBpm " + String(tempoDeviationBpm));
+    debug("--------- new scheduling cycle end ------------------");
+    */
+        
+     // if deviation is above tolerance or no out_tick_interval yet, then tempo change
+     if (tempoDeviationBpm > debouncerTolerance || !outClockTickIntervalMicros)
+     {
+        // round outClockTempo according to sensitivity
+        if (outClockTempoRoundingFactor > 0.0)
+           outClockTempo = roundf(inClockTempo * outClockTempoRoundingFactor) / outClockTempoRoundingFactor;
+        
+        /*
+        debug("---------tempo change begin ------------------");
+        debug("in bpm " + String(inClockTempo));
+        debug("out bpm " + String(outClockTempo));
+        debug("tempoDeviationBpm " + String(tempoDeviationBpm));
+        debug("debouncerTolerance " + String(debouncerTolerance));
+        debug("---------tempo change end ------------------");
+        */
+        outClockTickIntervalMicros = bpmToTickWidth(outClockTempo);
+        // debug("outClockTickIntervalMicros", outClockTickIntervalMicros);
+     }
+
+     // schedule next batch of ticks
+     // set last_out_tick to start of first window if not yet set
+     if (!outClockLastTickMicros)
+        outClockLastTickMicros = inClockLastStartMicros +
+        (outClockTickIntervalMicros * (inClockDebouncerCycleTicks-1));
+     
+     // determine starting timestamp of tick batch
+     schedulerReferenceTickNum = outClockTotalTickCount;
+     schedulerReferenceTickMicros = outClockLastTickMicros;
+     schedulerReferenceTickInterval = outClockTickIntervalMicros;
+
+     // if our drift (received IN ticks vs. sent OUT ticks) is too large -> hard cut
+     // TODO: consider to implement smooth corretion by modify schedulerReferenceTickInterval for the next batch
+     if (outClockTotalTickCount > inClockTotalTickCount && outClockTotalTickCount - inClockTotalTickCount > 3) {
+      schedulerReferenceTickNum = inClockTotalTickCount;
+     }
+     if (outClockTotalTickCount < inClockTotalTickCount && inClockTotalTickCount - outClockTotalTickCount > 3) {
+      schedulerReferenceTickNum = inClockTotalTickCount;
+     }
 
   }
 
-  if (weHaveADebouncedTempo == false) {
-    // pass thru the jittering ticks until we know the tempo
-    sendClockTick();
+  /*
+  incoming_tick:
+  {
+  
   }
+  */
+
+  // update tick stats/counters
+  inClockTotalTickCount++;
+  inClockLastTickMicros = currentMicros;
 }
-
 
 /**
  * check if there is need to send out a single clock tick
  */
 void checkSendOutClockTick() {
 
-  if (weHaveADebouncedTempo == false) {
-    // after start we have to collect some timings for beeing able to dejitter
-    // during this phase the jittered ticks will be directly sent out in handleMidiEventClock()
+  if (inClockTotalTickCount < inClockDebouncerCycleTicks || inClockDebouncerCycleTicks == 0)
+  {
+    return;
+  }
+  // apply clock delay
+  // positive = send later than recieve
+  // negative = send before recieve
+  if (clockDelayMillis < 0 && currentMicros < abs(clockDelayMillis*1000)) {
     return;
   }
 
-  if (currentMicros <= scheduledNextTickMicroSecond) {
-    // we still have to wait before sending the tick
-    return;
-  }
-  
-  if (currentMicros - outClockLastSentTick < maxBpmTickWidth) {
-    // never send a tempo faster than 312 BPM
+
+  // wait at least 5 millisecond between ticks (gets applied when we have a negative value of clockDelayMicros)
+  if (currentMicros - outClockLastTickMicros < 5000) {
     return;
   }
 
-  sendClockTick();
+  // check if already sent out tick num < needed ticknum
+  if (outClockTotalTickCount < (currentMicros - (clockDelayMillis * 1000) - schedulerReferenceTickMicros) / schedulerReferenceTickInterval + schedulerReferenceTickNum) {
+    sendClockTick();
+  }
 }
 
 /**
  * really send the tick and calculate the time when the next tick has to be sent
  */
 void sendClockTick() {
-
-  if (forcedTickDeltaOfClockDelay < 0 && inClockTickCounter < abs(forcedTickDeltaOfClockDelay)) {
-    // do not send out ticks if we have a configured negative clock offset (send later than recieve)
-    return;
-  }
-
-  if (outClockTickCounter == 0) {
-    outClockLastFullBarStart = currentMicros;
-  }
-  outClockTickCounter+=1;
-  outClockFullBarTickCounter+=1;
-  outClockLastSentTick = currentMicros;
-  if (outClockFullBarTickCounter == ppqn*4) {
-    outClockLastFullBarStart = currentMicros;
-    outClockFullBarTickCounter = 0;
-  }
+  outClockLastTickMicros = currentMicros;
+  outClockTotalTickCount++;
+  
 #ifdef USE_MIDI_LIBRARY
   MIDI.sendClock();
 #else USE_MIDI_LIBRARY
   MIDI.write(0xF8);
 #endif
-
-  // without any drift next tick has to be sent in debouncedTickWidth microseconds
-  scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*debouncedTickWidth);
-  applyClockDelay();
-
-  if (inClockTickCounter > (outClockTickCounter + tickDriftTreshold + forcedTickDeltaOfClockDelay)) {
-    // we are behind. lets remove a little time of scheduled next tick by increasing the tempo by <driftAmount> BPM
-    inOutTickDrift = inClockTickCounter - outClockTickCounter + forcedTickDeltaOfClockDelay;
-
-    driftingTickWidth = bpmToTickWidth((float)(currentTempo + inOutTickDrift));
-    debug("driftingTickWidth [behind] " + String(driftingTickWidth) + " " + String(debouncedTickWidth));
-
-    scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*driftingTickWidth);
-    applyClockDelay();
-
-    // pseudo debugging to see the drift in the output of aseqdump (./monitor-midi-clock-jitter.py)
-    /*
-    MIDI.write(0x90); // MIDI Note-on; channel 1
-    MIDI.write(60); // MIDI note pitch 60
-    MIDI.write(inOutTickDrift); // MIDI note velocity inOutTickDrift
-    */
-    
-    return;
-  }
-
-  if (outClockTickCounter > (inClockTickCounter + tickDriftTreshold + forcedTickDeltaOfClockDelay)) {
-    // our in out tick drift is tooo large (we are ahead)
-    // add a little time to the schedule by decreasing the tempo by <driftAmount> BPM
-    
-    inOutTickDrift = outClockTickCounter - inClockTickCounter + forcedTickDeltaOfClockDelay;
-
-    driftingTickWidth = (inOutTickDrift > currentTempo)
-      ? minBpmTickWidth
-      : bpmToTickWidth((float)(currentTempo - inOutTickDrift));
-
-    debug("driftingTickWidth [ahead] " + String(driftingTickWidth) + " " + String(debouncedTickWidth));
-
-    scheduledNextTickMicroSecond = outClockLastFullBarStart + ((outClockFullBarTickCounter+1)*driftingTickWidth);
-    applyClockDelay();
-    
-    //MIDI.write(0xFE);  // active sensing  (just for debuggung over serial visible in aseqdump)
-
-    // pseudo debugging to see the drift in the output of aseqdump (./monitor-midi-clock-jitter.py)
-    /*
-    MIDI.write(0x90); // MIDI Note-on; channel 1
-    MIDI.write(20);   // MIDI note pitch 20
-    MIDI.write(inOutTickDrift); // MIDI note velocity inOutTickDrift
-    */
-  }
 }
 
-void applyClockDelay() {
-  if (clockDelayMilliseconds == 0) {
-    // no need to apply any offset for the next tick
-    return;
-  }
-  if (clockDelayMilliseconds < 0) {
-    if(currentMicros < clockDelayMilliseconds * -1000) {
-      // we cant apply a negative offset until we have reached this time
-      return;
-    }
-  }
-  scheduledNextTickMicroSecond += (clockDelayMilliseconds*1000);
-}
 
 void handleMidiEventStart() {
   resetJitterHelperVariables();
@@ -338,11 +422,12 @@ void handleMidiEventStart() {
 #else
   MIDI.write(0xFA);
 #endif
-  inClockLastQuarterBarStart = currentMicros;
-#ifdef USE_LCD
-      lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print("start");
+
+
+#ifdef USE_LCD1602
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("start");
 #endif
 }
 
@@ -352,39 +437,43 @@ void handleMidiEventStop() {
 #else
   MIDI.write(0xFC);
 #endif
-  
   resetJitterHelperVariables();
-  // most clocks also send ticks during stop
-  inClockLastQuarterBarStart = currentMicros;
 
-#ifdef USE_LCD
-      lcd.clear();
-      lcd.setCursor(0,0);
-      lcd.print("stop");
+#ifdef USE_LCD1602
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("stop");
 #endif
 }
 
-float tickWidthToBpm(int32_t tickWidth)
+float tickWidthToBpm(uint64_t tickWidth)
 {
   // calculate tempo [BPM] based on tick width [microseconds]
   if (tickWidth < 1) {
     return 0;
   }
-  return 60 / (tickWidth * 0.000001 * ppqn);
+  return 60 / (tickWidth * 0.000001 * PPQN);
 }
 
-uint32_t bpmToTickWidth(float bpm)
+uint64_t bpmToTickWidth(float bpm)
 {
-  // calculate interval of clock tick[microseconds] (24 ppqn)
+  // calculate interval of clock tick[microseconds] (24 inClockDebouncerCycleTicks)
   if (bpm < 1) {
     return 0;
   }
-  return 60 / (bpm * 0.000001 * ppqn);
+  return 60 / (bpm * 0.000001 * PPQN);
 }
 
 void debug(String Msg)
 {
 #ifdef USE_SOFTWARE_SERIAL_PIN_2_3
   Serial.println(Msg);
+#endif
+}
+
+void debug(String Msg, uint64_t value)
+{
+#ifdef USE_SOFTWARE_SERIAL_PIN_2_3
+  Serial.print(Msg + ": "); Serial.println(PriUint64<DEC>(value));
 #endif
 }
