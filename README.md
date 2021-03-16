@@ -1,7 +1,6 @@
 # midi-clock-dejitter
 **Tryout** for an Arduino based midi clock stabilizer  
-**Unfortunately this does not work as good as expected :/**  
-Around 20% of the time the outgoing clock is jittering as well. In case you know the reason feel free to create an issue and tell me the reason.
+It seems to work pretty well on an Arduino UNO with DIN IN+OUT
 
 ## recieving MIDI clock via bluetooth is not that stable
 
