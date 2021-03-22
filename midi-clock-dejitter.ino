@@ -80,6 +80,7 @@ int32_t inClockDebouncerCycleMod = 0;               // [tick]
 
 float debouncerTolerance = .0;
 
+// our orientation tick
 uint64_t schedulerReferenceTickNum = 0;      // [tick]
 uint64_t schedulerReferenceTickMicros = 0;   // [microsecond]
 uint64_t schedulerReferenceTickInterval = 0; // [microsecond]
@@ -111,19 +112,23 @@ void setSensitivity() {
   debouncerTolerance = .25;
   
   // TODO switch..case possible with double??
-  if (sensitivity == 16) {  outClockTempoRoundingFactor =    .2; debouncerTolerance = 2.5;   }
-  if (sensitivity == 8) {   outClockTempoRoundingFactor =    .1; debouncerTolerance = 5.0;   }
-  if (sensitivity == 4) {   outClockTempoRoundingFactor =   1;   debouncerTolerance =  .5;   }
-  if (sensitivity == 2) {   outClockTempoRoundingFactor =   2.0; debouncerTolerance =  .25;  }
-  if (sensitivity == 1) {   outClockTempoRoundingFactor =  10.0; debouncerTolerance =  .05;  }
-  if (sensitivity == .5) {  outClockTempoRoundingFactor =  20.0; debouncerTolerance =  .025; }
+  if (sensitivity == 16)  { outClockTempoRoundingFactor =    .2; debouncerTolerance = 5.0;   }
+  if (sensitivity == 8)   { outClockTempoRoundingFactor =    .1; debouncerTolerance = 2.5;   }
+  if (sensitivity == 4)   { outClockTempoRoundingFactor =   1;   debouncerTolerance =  .5;   }
+  if (sensitivity == 2)   { outClockTempoRoundingFactor =   2.0; debouncerTolerance =  .25;  }
+  if (sensitivity == 1)   { outClockTempoRoundingFactor =  10.0; debouncerTolerance =  .05;  }
+  if (sensitivity == .5)  { outClockTempoRoundingFactor =  20.0; debouncerTolerance =  .025; }
   if (sensitivity == .25) { outClockTempoRoundingFactor = 100.0; debouncerTolerance =  .01;  }
 
   inClockDebouncerCycleTicks = sensitivity * PPQN;
 
   // cycle mod is 2/3 of a cycle or 24 ticks if distributing
-  inClockDebouncerCycleMod = (inClockDebouncerCycleTicks ? inClockDebouncerCycleTicks / 3 * 2 - 1 : PPQN);
-  inClockDebouncerAverageCountMax = (inClockDebouncerCycleTicks ? inClockDebouncerCycleTicks : PPQN);
+  inClockDebouncerCycleMod = inClockDebouncerCycleTicks
+    ? inClockDebouncerCycleTicks / 3 * 2 - 1
+    : PPQN;
+  inClockDebouncerAverageCountMax = inClockDebouncerCycleTicks
+    ? inClockDebouncerCycleTicks
+    : PPQN;
 }
 
 
@@ -176,7 +181,6 @@ void loop() {
       handleMidiEventStart();
     }
     if (incomingByte == 0xFC) {
-      // debug("incoming byte is stop");
       handleMidiEventStop();
     }
   }
@@ -223,23 +227,18 @@ void handleMidiEventClock() {
   uint16_t mod = inClockTotalTickCount % inClockDebouncerCycleTicks;
    
   // set anchor if tick 0
-  if (inClockTotalTickCount == 0)
-  {
+  if (inClockTotalTickCount == 0) {
      inClockLastStartMicros = currentMicros;
   }
 
-
-
   // update incoming average
-  if (inClockTotalTickCount)
-  {
+  if (inClockTotalTickCount) {
      // total them up
      uint64_t sum = inClockDebouncerAverageCount * inClockDebouncerAverageIntervalMicros;
      
      // remove extra ticks+1 that we are about to add from sum
      // (also cater for distribution case)
-     if (inClockDebouncerAverageCount >= inClockDebouncerAverageCountMax)
-     {
+     if (inClockDebouncerAverageCount >= inClockDebouncerAverageCountMax) {
         uint16_t remove = inClockDebouncerAverageCount - inClockDebouncerAverageCountMax + 1;
         inClockDebouncerAverageCount -= remove;
         sum -= (inClockDebouncerAverageIntervalMicros * remove);
@@ -272,18 +271,17 @@ void handleMidiEventClock() {
 
   // if tick_count < cycle_ticks then pass these - first tracking cycle
   // or if we are distributing only
-  if (inClockTotalTickCount < inClockDebouncerCycleTicks || inClockDebouncerCycleTicks == 0)
-  {
+  if (inClockTotalTickCount < inClockDebouncerCycleTicks || inClockDebouncerCycleTicks == 0) {
      sendClockTick();
      
-     if (inClockDebouncerCycleTicks == 0)
-     {
+     if (inClockDebouncerCycleTicks == 0) {
         // only distributing, so need to manually update in bpm every 24 ticks
-        if (inClockTotalTickCount && (inClockTotalTickCount % inClockDebouncerCycleMod) == 0)
-        {
+        if (inClockTotalTickCount && (inClockTotalTickCount % inClockDebouncerCycleMod) == 0) {
            // calculate deviation for distribution
            float inClockTempo = tickWidthToBpm(inClockDebouncerAverageIntervalMicros);
-           float outClockTempo = (outClockTickIntervalMicros ? tickWidthToBpm(outClockTickIntervalMicros) : inClockTempo);
+           float outClockTempo = outClockTickIntervalMicros
+             ? tickWidthToBpm(outClockTickIntervalMicros)
+             : inClockTempo;
            
            // use out_tick_interval to retain our previous bpm
            outClockTickIntervalMicros = inClockDebouncerAverageIntervalMicros;
@@ -291,8 +289,6 @@ void handleMidiEventClock() {
            // determine deviation in bpm
            tempoDeviationBpm = fabs(outClockTempo - inClockTempo);
         }
-        
-        //goto incoming_tick;
         
         inClockTotalTickCount++;
         inClockLastTickMicros = currentMicros;
@@ -302,8 +298,7 @@ void handleMidiEventClock() {
 
 
   // schedule batch of our own cycle_ticks when tick_count % cycle_ticks == 2/3 of a cycle
-  if (mod == inClockDebouncerCycleMod)
-  {         
+  if (mod == inClockDebouncerCycleMod) {
      // determine current in/out tempo
      float inClockTempo = tickWidthToBpm(inClockDebouncerAverageIntervalMicros);
      float outClockTempo = (outClockTickIntervalMicros ? tickWidthToBpm(outClockTickIntervalMicros) : inClockTempo);
@@ -349,7 +344,7 @@ void handleMidiEventClock() {
      schedulerReferenceTickMicros = outClockLastTickMicros;
      schedulerReferenceTickInterval = outClockTickIntervalMicros;
 
-     // if our drift (received IN ticks vs. sent OUT ticks) is too large -> hard cut
+     // if our drift (received IN ticks vs. sent OUT ticks) is too large -> hard correction
      // TODO: consider to implement smooth corretion by modify schedulerReferenceTickInterval for the next batch
      if (outClockTotalTickCount > inClockTotalTickCount && outClockTotalTickCount - inClockTotalTickCount > 3) {
       schedulerReferenceTickNum = inClockTotalTickCount;
@@ -360,27 +355,21 @@ void handleMidiEventClock() {
 
   }
 
-  /*
-  incoming_tick:
-  {
-  
-  }
-  */
-
   // update tick stats/counters
   inClockTotalTickCount++;
   inClockLastTickMicros = currentMicros;
 }
 
 /**
- * check if there is need to send out a single clock tick
+ * check if there is need to send out a single
+ * clock tick in an unjittered interval
  */
 void checkSendOutClockTick() {
 
-  if (inClockTotalTickCount < inClockDebouncerCycleTicks || inClockDebouncerCycleTicks == 0)
-  {
+  if (inClockTotalTickCount < inClockDebouncerCycleTicks || inClockDebouncerCycleTicks == 0) {
     return;
   }
+
   // apply clock delay
   // positive = send later than recieve
   // negative = send before recieve
@@ -389,7 +378,7 @@ void checkSendOutClockTick() {
   }
 
 
-  // wait at least 5 millisecond between ticks (gets applied when we have a negative value of clockDelayMicros)
+  // wait at least 5 milliseconds between ticks (gets applied when we have a negative value of clockDelayMicros)
   if (currentMicros - outClockLastTickMicros < 5000) {
     return;
   }
@@ -401,7 +390,7 @@ void checkSendOutClockTick() {
 }
 
 /**
- * really send the tick and calculate the time when the next tick has to be sent
+ * really send the tick
  */
 void sendClockTick() {
   outClockLastTickMicros = currentMicros;
@@ -409,7 +398,7 @@ void sendClockTick() {
   
 #ifdef USE_MIDI_LIBRARY
   MIDI.sendClock();
-#else USE_MIDI_LIBRARY
+#else
   MIDI.write(0xF8);
 #endif
 }
@@ -455,8 +444,7 @@ float tickWidthToBpm(uint64_t tickWidth)
   return 60 / (tickWidth * 0.000001 * PPQN);
 }
 
-uint64_t bpmToTickWidth(float bpm)
-{
+uint64_t bpmToTickWidth(float bpm) {
   // calculate interval of clock tick[microseconds] (24 inClockDebouncerCycleTicks)
   if (bpm < 1) {
     return 0;
@@ -464,16 +452,15 @@ uint64_t bpmToTickWidth(float bpm)
   return 60 / (bpm * 0.000001 * PPQN);
 }
 
-void debug(String Msg)
-{
+void debug(String Msg) {
 #ifdef USE_SOFTWARE_SERIAL_PIN_2_3
   Serial.println(Msg);
 #endif
 }
 
-void debug(String Msg, uint64_t value)
-{
+void debug(String Msg, uint64_t value) {
 #ifdef USE_SOFTWARE_SERIAL_PIN_2_3
-  Serial.print(Msg + ": "); Serial.println(PriUint64<DEC>(value));
+  Serial.print(Msg + ": ");
+  Serial.println(PriUint64<DEC>(value));
 #endif
 }
