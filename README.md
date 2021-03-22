@@ -15,7 +15,7 @@ After doing some research you have 2 choices to solve this problem:
 In case you have an `ATMEGA16U2` chip and you are able to route your MIDI signals via USB all you need is an USB cable. No additional parts or soldering required. See [firmware](https://github.com/othmar52/midi-clock-dejitter/tree/main/firmware) to turn your Arduino into a class clompliant MIDI device.
 
 ### `DIN MIDI` for Arduino UNO
-![DIN MIDI for Arduino UNO](https://github.com/othmar52/midi-clock-dejitter/blob/master/media/din-midi-in-out.png?raw=true)
+![DIN MIDI for Arduino UNO](https://raw.githubusercontent.com/othmar52/midi-clock-dejitter/main/media/din-midi-in-out.png)
 
 ## Alternatives
 The iOS+macOS app [MidiPace by Audeonic](https://audeonic.com/midipace/) seems to be a rock solid alternative
