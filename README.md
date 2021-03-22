@@ -1,6 +1,6 @@
 # midi-clock-dejitter
 **Tryout** for an Arduino based midi clock stabilizer  
-It seems to work pretty well on an Arduino UNO with DIN IN+OUT
+It seems to work pretty well on an Arduino UNO with MIDI in+out (DIN-MIDI or USB-MIDI)
 
 ## recieving MIDI clock via bluetooth is not that stable
 
